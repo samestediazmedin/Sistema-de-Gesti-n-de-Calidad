@@ -299,7 +299,7 @@ Si se agregan nuevos modelos o columnas:
    - Solución: Verifica que el archivo `vercel.json` esté en la raíz del repositorio de React.
 4. **Error de conexión a la Base de Datos (`Is the server running on host...`)**:
    - Causa: La base de datos externa requiere conexión SSL o expiró la instancia gratuita.
-   - Solución: Agrega `?sslmode=require` al final de `DATABASE_URL` y verifica en el dashboard de PostgreSQL que el servicio se encuentre activo.
+   - Solución: Agrega `?sslmode=require` al final de `DATABASE_URL` y verifica en el dashboard de PostgreSQL que el servidor se encuentre activo.
 
 ---
 

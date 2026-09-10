@@ -1,0 +1,146 @@
+"""
+Aplicación principal FastAPI
+"""
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from .config import settings
+from .api import (
+    routes, usuarios, procesos, documentos, 
+    calidad, auditorias, riesgos, capacitaciones, competencias, sistema, auth, migraciones, tickets, notificaciones,
+    analytics, reportes, uploads, codigos
+)
+
+
+
+app = FastAPI(
+    title="Sistema de Gestión de Calidad",
+    description="API para sistema de gestión de calidad ISO 9001",
+    version="1.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins_list,
+    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=600,
+)
+
+
+def _cors_para_origen(request: Request) -> dict[str, str]:
+    origen = (request.headers.get("origin") or "").strip()
+    if not origen:
+        return {}
+    permitidos = set(settings.cors_origins_list)
+    if origen in permitidos or origen.endswith(".vercel.app"):
+        return {
+            "Access-Control-Allow-Origin": origen,
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Expose-Headers": "*",
+        }
+    return {}
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """Evita 500 sin CORS (el navegador lo muestra como fallo de red)."""
+    if isinstance(exc, StarletteHTTPException):
+        return await http_exception_handler(request, exc)
+    if isinstance(exc, RequestValidationError):
+        return await request_validation_exception_handler(request, exc)
+    print(f"ERROR no controlado en {request.method} {request.url.path}: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Error interno del servidor: {exc}"[:300]},
+        headers=_cors_para_origen(request),
+    )
+
+# ... (omitted)
+
+# Incluir routers
+app.include_router(auth.router)
+app.include_router(routes.router)
+app.include_router(usuarios.router)
+app.include_router(procesos.router)
+app.include_router(documentos.router)
+app.include_router(codigos.router)
+app.include_router(calidad.router)
+app.include_router(auditorias.router)
+app.include_router(riesgos.router)
+app.include_router(capacitaciones.router)
+app.include_router(competencias.router)
+app.include_router(notificaciones.router)
+app.include_router(sistema.router)
+app.include_router(migraciones.router, prefix="/api/migraciones", tags=["migraciones"])
+app.include_router(tickets.router, prefix="/api/v1/tickets", tags=["tickets"])
+app.include_router(analytics.router)
+app.include_router(reportes.router)
+app.include_router(uploads.router)
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Evento que se ejecuta al iniciar la aplicación"""
+    print(f"🚀 Iniciando {settings.APP_NAME} v{settings.APP_VERSION}")
+    print(f"📝 Documentación disponible en: http://localhost:8000/docs")
+    print(f"🌍 Entorno: {settings.ENVIRONMENT}")
+
+    if (settings.ENVIRONMENT or "").lower() == "test":
+        return
+
+    try:
+        from .db.ensure_schema import asegurar_esquema_login
+
+        columnas = asegurar_esquema_login()
+        if columnas:
+            print(f"✅ Esquema de login actualizado | columnas={','.join(columnas)}")
+        else:
+            print("✅ Esquema de login verificado")
+    except Exception as exc:
+        print(f"⚠️ No se pudo actualizar el esquema de login al arrancar: {exc}")
+
+    try:
+        from .db.ensure_schema import asegurar_esquema_calidad
+
+        calidad_cols = asegurar_esquema_calidad()
+        if calidad_cols:
+            print(f"✅ Esquema de calidad actualizado | {','.join(calidad_cols)}")
+        else:
+            print("✅ Esquema de calidad verificado")
+    except Exception as exc:
+        print(f"⚠️ No se pudo actualizar el esquema de calidad al arrancar: {exc}")
+
+    try:
+        from .database import SessionLocal
+        from .db.sync_rbac import sincronizar_rbac_sgc
+
+        db = SessionLocal()
+        try:
+            resumen = sincronizar_rbac_sgc(db, reemplazar_existentes=False)
+            print(
+                "✅ RBAC SGC sincronizado | "
+                f"creados={resumen['roles_creados']} "
+                f"eliminados={resumen['roles_eliminados']} "
+                f"migrados={resumen['usuarios_migrados']}"
+            )
+        finally:
+            db.close()
+    except Exception as exc:
+        print(f"⚠️ No se pudo sincronizar el catálogo RBAC al arrancar: {exc}")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Evento que se ejecuta al cerrar la aplicación"""
+    print("👋 Cerrando aplicación...")
+
+
+
+

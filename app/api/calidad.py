@@ -1,0 +1,1232 @@
+"""
+Endpoints CRUD para gestión de calidad
+"""
+from fastapi import APIRouter, Depends, HTTPException, status, Body
+from sqlalchemy.orm import Session, joinedload
+from typing import List, Optional
+from uuid import UUID
+
+from ..database import get_db
+from ..models.calidad import Indicador, NoConformidad, AccionCorrectiva, ObjetivoCalidad, SeguimientoObjetivo, AccionCorrectivaComentario
+from ..schemas.calidad import (
+    IndicadorCreate,
+    IndicadorUpdate,
+    IndicadorResponse,
+    IndicadorDecision,
+    MedicionIndicadorCreate,
+    MedicionIndicadorResponse,
+    TendenciaIndicadorResponse,
+    NoConformidadCreate,
+    NoConformidadUpdate,
+    NoConformidadResponse,
+    AccionCorrectivaCreate,
+    AccionCorrectivaUpdate,
+    AccionCorrectivaResponse,
+    AccionCorrectivaEstadoUpdate,
+    AccionCorrectivaVerificacion,
+    AccionCorrectivaImplementacion,
+    AccionCorrectivaComentarioCreate,
+    AccionCorrectivaComentarioResponse,
+    ObjetivoCalidadCreate,
+    ObjetivoCalidadUpdate,
+
+    ObjetivoCalidadResponse,
+    SeguimientoObjetivoCreate,
+    SeguimientoObjetivoUpdate,
+    SeguimientoObjetivoResponse
+)
+from ..api.dependencies import require_any_permission
+from ..models.usuario import Usuario, Area
+from ..utils.notification_service import notificar_asignacion, crear_notificacion_aprobacion
+from ..utils.codigos import asignar_codigo, prefijo_anual, prefijo_indicador
+from ..services.calidad_service import CalidadService
+from ..services.indicador_service import IndicadorService
+
+router = APIRouter(prefix="/api/v1", tags=["calidad"])
+
+
+def _obtener_usuario_activo(db: Session, usuario_id: UUID, campo: str = "usuario") -> Usuario:
+    usuario = db.query(Usuario).filter(Usuario.id == usuario_id).first()
+    if not usuario:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"El {campo} seleccionado no existe"
+        )
+    if not usuario.activo:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"El {campo} seleccionado está inactivo y no puede ser asignado"
+        )
+    return usuario
+
+
+# ======================
+# Endpoints de Indicadores
+# ======================
+
+def _servicio_indicadores(db: Session) -> IndicadorService:
+    return IndicadorService(db)
+
+
+@router.get("/indicadores", response_model=List[IndicadorResponse])
+def listar_indicadores(
+    skip: int = 0,
+    limit: int = 200,
+    proceso_id: UUID = None,
+    activo: bool = None,
+    tipo_indicador: str = None,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["calidad.ver", "sistema.admin"]))
+):
+    """Listar indicadores de desempeño"""
+    from sqlalchemy.orm import noload
+    from ..db.ensure_schema import asegurar_esquema_calidad
+
+    try:
+        asegurar_esquema_calidad()
+    except Exception:
+        pass
+
+    try:
+        return _servicio_indicadores(db).listar(
+            proceso_id=proceso_id,
+            activo=activo,
+            tipo_indicador=tipo_indicador,
+            skip=skip,
+            limit=limit,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        texto = str(exc).lower()
+        db.rollback()
+        if "undefinedcolumn" in texto.replace(" ", "") or "does not exist" in texto:
+            try:
+                asegurar_esquema_calidad()
+                return _servicio_indicadores(db).listar(
+                    proceso_id=proceso_id,
+                    activo=activo,
+                    tipo_indicador=tipo_indicador,
+                    skip=skip,
+                    limit=limit,
+                )
+            except Exception:
+                db.rollback()
+        try:
+            return (
+                db.query(Indicador)
+                .options(
+                    noload(Indicador.mediciones),
+                    noload(Indicador.proceso),
+                    noload(Indicador.responsable_medicion),
+                    noload(Indicador.creador),
+                    noload(Indicador.revisador),
+                    noload(Indicador.aprobador),
+                )
+                .order_by(Indicador.codigo.asc())
+                .offset(skip)
+                .limit(limit)
+                .all()
+            )
+        except Exception as exc2:
+            db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"No se pudieron cargar indicadores: {exc2}",
+            ) from exc2
+
+
+@router.post("/indicadores", response_model=IndicadorResponse, status_code=status.HTTP_201_CREATED)
+def crear_indicador(
+    indicador: IndicadorCreate, 
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["calidad.ver", "sistema.admin"]))
+):
+    """Crear un nuevo indicador"""
+    if indicador.responsable_medicion_id:
+        _obtener_usuario_activo(db, indicador.responsable_medicion_id, "responsable de medición")
+
+    data = indicador.model_dump()
+    data["codigo"] = asignar_codigo(
+        db,
+        Indicador,
+        data.get("codigo"),
+        prefijo_indicador(indicador.tipo_indicador),
+    )
+    data["creado_por"] = current_user.id
+    data["estado"] = "borrador"
+    nuevo_indicador = Indicador(**data)
+    db.add(nuevo_indicador)
+    db.commit()
+    notificar_asignacion(
+        db,
+        usuario_id=nuevo_indicador.responsable_medicion_id,
+        titulo="Indicador asignado",
+        mensaje=f"Se te ha asignado el indicador {nuevo_indicador.codigo}",
+        referencia_tipo="indicador",
+        referencia_id=nuevo_indicador.id,
+        actor_id=current_user.id,
+    )
+    return _servicio_indicadores(db).obtener(nuevo_indicador.id)
+
+
+@router.get("/indicadores/{indicador_id}", response_model=IndicadorResponse)
+def obtener_indicador(
+    indicador_id: UUID, 
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["calidad.ver", "sistema.admin"]))
+):
+    """Obtener un indicador por ID"""
+    return _servicio_indicadores(db).obtener(indicador_id)
+
+
+@router.put("/indicadores/{indicador_id}", response_model=IndicadorResponse)
+def actualizar_indicador(
+    indicador_id: UUID,
+    indicador_update: IndicadorUpdate,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["calidad.ver", "sistema.admin"]))
+):
+    """Actualizar un indicador"""
+    indicador = db.query(Indicador).filter(Indicador.id == indicador_id).first()
+    if not indicador:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Indicador no encontrado"
+        )
+    
+    anterior_responsable = indicador.responsable_medicion_id
+    update_data = indicador_update.model_dump(exclude_unset=True)
+    if "responsable_medicion_id" in update_data and update_data["responsable_medicion_id"]:
+        _obtener_usuario_activo(db, update_data["responsable_medicion_id"], "responsable de medición")
+    if "codigo" in update_data and update_data["codigo"] != indicador.codigo:
+        existe = db.query(Indicador).filter(Indicador.codigo == update_data["codigo"], Indicador.id != indicador_id).first()
+        if existe:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El código de indicador ya existe")
+
+    campos_controlados = {"nombre", "descripcion", "formula", "meta", "unidad_medida", "frecuencia_medicion", "tipo_indicador"}
+    toca_definicion = any(campo in update_data for campo in campos_controlados)
+
+    for field, value in update_data.items():
+        setattr(indicador, field, value)
+
+    if toca_definicion and indicador.estado == "aprobado":
+        indicador.estado = "pendiente_aprobacion"
+    
+    db.commit()
+    notificar_asignacion(
+        db,
+        usuario_id=indicador.responsable_medicion_id,
+        titulo="Indicador asignado",
+        mensaje=f"Se te ha asignado el indicador {indicador.codigo}",
+        referencia_tipo="indicador",
+        referencia_id=indicador.id,
+        actor_id=current_user.id,
+        anterior_usuario_id=anterior_responsable,
+    )
+    return _servicio_indicadores(db).obtener(indicador_id)
+
+
+@router.delete("/indicadores/{indicador_id}", status_code=status.HTTP_204_NO_CONTENT)
+def eliminar_indicador(
+    indicador_id: UUID, 
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["calidad.ver", "sistema.admin"]))
+):
+    """Eliminar un indicador"""
+    indicador = db.query(Indicador).filter(Indicador.id == indicador_id).first()
+    if not indicador:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Indicador no encontrado"
+        )
+    
+    db.delete(indicador)
+    db.commit()
+    return None
+
+
+@router.post("/indicadores/{indicador_id}/mediciones", response_model=MedicionIndicadorResponse, status_code=status.HTTP_201_CREATED)
+def registrar_medicion_indicador(
+    indicador_id: UUID,
+    medicion: MedicionIndicadorCreate,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["calidad.ver", "sistema.admin"])),
+):
+    service = IndicadorService(db)
+    return service.registrar_medicion(indicador_id, medicion.model_dump(), current_user.id)
+
+
+@router.get("/indicadores/{indicador_id}/mediciones", response_model=List[MedicionIndicadorResponse])
+def historial_mediciones_indicador(
+    indicador_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["calidad.ver", "sistema.admin"])),
+):
+    service = IndicadorService(db)
+    return service.historial(indicador_id)
+
+
+@router.get("/indicadores/{indicador_id}/tendencia", response_model=TendenciaIndicadorResponse)
+def tendencia_indicador(
+    indicador_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["calidad.ver", "sistema.admin"])),
+):
+    service = IndicadorService(db)
+    return service.tendencia(indicador_id)
+
+
+@router.post("/indicadores/{indicador_id}/solicitar-aprobacion", response_model=IndicadorResponse)
+def solicitar_aprobacion_indicador(
+    indicador_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["calidad.ver", "sistema.admin"])),
+):
+    return _servicio_indicadores(db).solicitar_aprobacion(indicador_id, current_user.id)
+
+
+@router.post("/indicadores/{indicador_id}/aprobar", response_model=IndicadorResponse)
+def aprobar_indicador(
+    indicador_id: UUID,
+    decision: Optional[IndicadorDecision] = None,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["calidad.ver", "sistema.admin"])),
+):
+    indicador = _servicio_indicadores(db).aprobar(
+        indicador_id,
+        current_user.id,
+        decision.observacion if decision else None,
+    )
+    if indicador.creado_por:
+        crear_notificacion_aprobacion(
+            db,
+            usuario_id=indicador.creado_por,
+            titulo="Indicador aprobado",
+            mensaje=f"El indicador {indicador.codigo} fue aprobado.",
+            referencia_tipo="indicador",
+            referencia_id=indicador.id,
+        )
+    return indicador
+
+
+@router.post("/indicadores/{indicador_id}/rechazar", response_model=IndicadorResponse)
+def rechazar_indicador(
+    indicador_id: UUID,
+    decision: IndicadorDecision,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["calidad.ver", "sistema.admin"])),
+):
+    indicador = _servicio_indicadores(db).rechazar(indicador_id, current_user.id, decision.observacion)
+    if indicador.creado_por:
+        crear_notificacion_aprobacion(
+            db,
+            usuario_id=indicador.creado_por,
+            titulo="Indicador rechazado",
+            mensaje=f"El indicador {indicador.codigo} fue rechazado. {decision.observacion or ''}".strip(),
+            referencia_tipo="indicador",
+            referencia_id=indicador.id,
+        )
+    return indicador
+
+
+# =============================
+# Endpoints de No Conformidades
+# =============================
+
+@router.get("/no-conformidades", response_model=List[NoConformidadResponse])
+def listar_no_conformidades(
+    skip: int = 0,
+    limit: int = 100,
+    proceso_id: UUID = None,
+    estado: str = None,
+    tipo: str = None,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["noconformidades.reportar", "noconformidades.gestion", "noconformidades.cerrar", "sistema.admin"]))
+):
+    """Listar no conformidades"""
+    query = db.query(NoConformidad)
+    
+    if proceso_id:
+        query = query.filter(NoConformidad.proceso_id == proceso_id)
+    if estado:
+        query = query.filter(NoConformidad.estado == estado)
+    if tipo:
+        query = query.filter(NoConformidad.tipo == tipo)
+    
+    no_conformidades = query.options(
+        joinedload(NoConformidad.proceso),
+        joinedload(NoConformidad.detector),
+        joinedload(NoConformidad.responsable)
+    ).offset(skip).limit(limit).all()
+    return no_conformidades
+
+
+@router.post("/no-conformidades", response_model=NoConformidadResponse, status_code=status.HTTP_201_CREATED)
+def crear_no_conformidad(
+    nc: NoConformidadCreate, 
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["noconformidades.reportar", "sistema.admin"]))
+):
+    """Crear una nueva no conformidad"""
+    # Verify permission "noconformidades.reportar"
+    tiene_permiso = any(
+        rp.permiso.codigo == "noconformidades.reportar" 
+        for ur in current_user.roles 
+        for rp in ur.rol.permisos
+        if rp.permiso
+    )
+    if not tiene_permiso:
+        raise HTTPException(status_code=403, detail="No tienes permiso para reportar no conformidades")
+
+    payload = nc.model_dump()
+    payload["codigo"] = asignar_codigo(db, NoConformidad, payload.get("codigo"), prefijo_anual("NC"))
+    if payload.get("detectado_por"):
+        _obtener_usuario_activo(db, payload["detectado_por"], "usuario detectado por")
+    if payload.get("responsable_id"):
+        _obtener_usuario_activo(db, payload["responsable_id"], "responsable")
+
+    nueva_nc = NoConformidad(**payload)
+    db.add(nueva_nc)
+    db.commit()
+    db.refresh(nueva_nc)
+    
+    # Recargar con relaciones
+    nueva_nc = db.query(NoConformidad).options(
+        joinedload(NoConformidad.proceso),
+        joinedload(NoConformidad.detector),
+        joinedload(NoConformidad.responsable)
+    ).filter(NoConformidad.id == nueva_nc.id).first()
+
+    notificar_asignacion(
+        db,
+        usuario_id=nueva_nc.responsable_id,
+        titulo="No conformidad asignada",
+        mensaje=f"Se te ha asignado la no conformidad {nueva_nc.codigo}",
+        referencia_tipo="no_conformidad",
+        referencia_id=nueva_nc.id,
+        actor_id=current_user.id,
+    )
+    return nueva_nc
+
+
+@router.get("/no-conformidades/{nc_id}", response_model=NoConformidadResponse)
+def obtener_no_conformidad(
+    nc_id: UUID, 
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["noconformidades.reportar", "noconformidades.gestion", "noconformidades.cerrar", "sistema.admin"]))
+):
+    """Obtener una no conformidad por ID"""
+    nc = db.query(NoConformidad).options(
+        joinedload(NoConformidad.proceso),
+        joinedload(NoConformidad.detector),
+        joinedload(NoConformidad.responsable)
+    ).filter(NoConformidad.id == nc_id).first()
+    
+    if not nc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No conformidad no encontrada"
+        )
+    return nc
+
+
+@router.put("/no-conformidades/{nc_id}", response_model=NoConformidadResponse)
+def actualizar_no_conformidad(
+    nc_id: UUID,
+    nc_update: NoConformidadUpdate,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["noconformidades.gestion", "sistema.admin"]))
+):
+    """Actualizar una no conformidad"""
+    nc = db.query(NoConformidad).filter(NoConformidad.id == nc_id).first()
+    if not nc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No conformidad no encontrada"
+        )
+
+    anterior_responsable = nc.responsable_id
+    update_data = nc_update.model_dump(exclude_unset=True)
+    if "detectado_por" in update_data and update_data["detectado_por"]:
+        _obtener_usuario_activo(db, update_data["detectado_por"], "usuario detectado por")
+    if "responsable_id" in update_data and update_data["responsable_id"]:
+        _obtener_usuario_activo(db, update_data["responsable_id"], "responsable")
+
+    for field, value in update_data.items():
+        setattr(nc, field, value)
+    
+    db.commit()
+    db.refresh(nc)
+    
+    # Recargar con relaciones
+    nc = db.query(NoConformidad).options(
+        joinedload(NoConformidad.proceso),
+        joinedload(NoConformidad.detector),
+        joinedload(NoConformidad.responsable)
+    ).filter(NoConformidad.id == nc_id).first()
+
+    notificar_asignacion(
+        db,
+        usuario_id=nc.responsable_id,
+        titulo="No conformidad asignada",
+        mensaje=f"Se te ha asignado la no conformidad {nc.codigo}",
+        referencia_tipo="no_conformidad",
+        referencia_id=nc.id,
+        actor_id=current_user.id,
+        anterior_usuario_id=anterior_responsable,
+    )
+    return nc
+
+
+@router.delete("/no-conformidades/{nc_id}", status_code=status.HTTP_204_NO_CONTENT)
+def eliminar_no_conformidad(
+    nc_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["noconformidades.gestion", "sistema.admin"]))
+):
+    """Eliminar una no conformidad"""
+    nc = db.query(NoConformidad).filter(NoConformidad.id == nc_id).first()
+    if not nc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No conformidad no encontrada"
+        )
+    
+    db.delete(nc)
+    db.commit()
+    return None
+
+
+# ================================
+# Endpoints de Acciones Correctivas
+# ================================
+
+@router.get("/acciones-correctivas", response_model=List[AccionCorrectivaResponse])
+def listar_acciones_correctivas(
+    skip: int = 0,
+    limit: int = 100,
+    no_conformidad_id: UUID = None,
+    estado: str = None,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["noconformidades.gestion", "noconformidades.cerrar", "sistema.admin"]))
+):
+    """Listar acciones correctivas"""
+    query = db.query(AccionCorrectiva).options(
+        joinedload(AccionCorrectiva.responsable),
+        joinedload(AccionCorrectiva.implementador),
+        joinedload(AccionCorrectiva.verificador),
+        joinedload(AccionCorrectiva.comentarios).joinedload(AccionCorrectivaComentario.usuario)
+    )
+    
+    if no_conformidad_id:
+        query = query.filter(AccionCorrectiva.no_conformidad_id == no_conformidad_id)
+    if estado:
+        query = query.filter(AccionCorrectiva.estado == estado)
+    
+    acciones = query.offset(skip).limit(limit).all()
+    return acciones
+
+
+@router.post("/acciones-correctivas", response_model=AccionCorrectivaResponse, status_code=status.HTTP_201_CREATED)
+def crear_accion_correctiva(
+    accion: AccionCorrectivaCreate, 
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["noconformidades.gestion", "sistema.admin"]))
+):
+    """Crear una nueva acción correctiva"""
+    payload = accion.model_dump()
+    payload["codigo"] = asignar_codigo(db, AccionCorrectiva, payload.get("codigo"), prefijo_anual("AC"))
+    for campo, etiqueta in (
+        ("responsable_id", "responsable"),
+        ("implementado_por", "implementador"),
+        ("verificado_por", "verificador"),
+    ):
+        if payload.get(campo):
+            _obtener_usuario_activo(db, payload[campo], etiqueta)
+
+    nueva_accion = AccionCorrectiva(**payload)
+    db.add(nueva_accion)
+    db.commit()
+    db.refresh(nueva_accion)
+    notificar_asignacion(
+        db,
+        usuario_id=nueva_accion.responsable_id,
+        titulo="Acción correctiva asignada",
+        mensaje=f"Se te ha asignado la acción correctiva {nueva_accion.codigo}",
+        referencia_tipo="accion_correctiva",
+        referencia_id=nueva_accion.id,
+        actor_id=current_user.id,
+    )
+    if nueva_accion.implementado_por:
+        notificar_asignacion(
+            db,
+            usuario_id=nueva_accion.implementado_por,
+            titulo="Implementación asignada",
+            mensaje=f"Se te asignó implementar la acción {nueva_accion.codigo}",
+            referencia_tipo="accion_correctiva",
+            referencia_id=nueva_accion.id,
+            actor_id=current_user.id,
+        )
+    if nueva_accion.verificado_por:
+        notificar_asignacion(
+            db,
+            usuario_id=nueva_accion.verificado_por,
+            titulo="Verificación asignada",
+            mensaje=f"Se te asignó verificar la acción {nueva_accion.codigo}",
+            referencia_tipo="accion_correctiva",
+            referencia_id=nueva_accion.id,
+            actor_id=current_user.id,
+        )
+    return nueva_accion
+
+
+@router.get("/acciones-correctivas/{accion_id}", response_model=AccionCorrectivaResponse)
+def obtener_accion_correctiva(
+    accion_id: UUID, 
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["noconformidades.gestion", "noconformidades.cerrar", "sistema.admin"]))
+):
+    """Obtener una acción correctiva por ID"""
+    accion = db.query(AccionCorrectiva).options(
+        joinedload(AccionCorrectiva.responsable),
+        joinedload(AccionCorrectiva.implementador),
+        joinedload(AccionCorrectiva.verificador),
+        joinedload(AccionCorrectiva.comentarios).joinedload(AccionCorrectivaComentario.usuario)
+    ).filter(AccionCorrectiva.id == accion_id).first()
+    if not accion:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Acción correctiva no encontrada"
+        )
+    return accion
+
+
+@router.put("/acciones-correctivas/{accion_id}", response_model=AccionCorrectivaResponse)
+def actualizar_accion_correctiva(
+    accion_id: UUID,
+    accion_update: AccionCorrectivaUpdate,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["noconformidades.gestion", "sistema.admin"]))
+):
+    """Actualizar una acción correctiva"""
+    accion = db.query(AccionCorrectiva).filter(AccionCorrectiva.id == accion_id).first()
+    if not accion:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Acción correctiva no encontrada"
+        )
+
+    anterior_responsable = accion.responsable_id
+    anterior_implementador = accion.implementado_por
+    anterior_verificador = accion.verificado_por
+    update_data = accion_update.model_dump(exclude_unset=True)
+    for campo, etiqueta in (
+        ("responsable_id", "responsable"),
+        ("implementado_por", "implementador"),
+        ("verificado_por", "verificador"),
+    ):
+        if campo in update_data and update_data[campo]:
+            _obtener_usuario_activo(db, update_data[campo], etiqueta)
+
+    for field, value in update_data.items():
+        setattr(accion, field, value)
+    
+    db.commit()
+    db.refresh(accion)
+    notificar_asignacion(
+        db,
+        usuario_id=accion.responsable_id,
+        titulo="Acción correctiva asignada",
+        mensaje=f"Se te ha asignado la acción correctiva {accion.codigo}",
+        referencia_tipo="accion_correctiva",
+        referencia_id=accion.id,
+        actor_id=current_user.id,
+        anterior_usuario_id=anterior_responsable,
+    )
+    notificar_asignacion(
+        db,
+        usuario_id=accion.implementado_por,
+        titulo="Implementación asignada",
+        mensaje=f"Se te asignó implementar la acción {accion.codigo}",
+        referencia_tipo="accion_correctiva",
+        referencia_id=accion.id,
+        actor_id=current_user.id,
+        anterior_usuario_id=anterior_implementador,
+    )
+    notificar_asignacion(
+        db,
+        usuario_id=accion.verificado_por,
+        titulo="Verificación asignada",
+        mensaje=f"Se te asignó verificar la acción {accion.codigo}",
+        referencia_tipo="accion_correctiva",
+        referencia_id=accion.id,
+        actor_id=current_user.id,
+        anterior_usuario_id=anterior_verificador,
+    )
+    return accion
+
+
+@router.patch("/acciones-correctivas/{accion_id}/estado", response_model=AccionCorrectivaResponse)
+def cambiar_estado_accion_correctiva(
+    accion_id: UUID,
+    estado_update: AccionCorrectivaEstadoUpdate,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["noconformidades.gestion", "noconformidades.cerrar", "sistema.admin"]))
+):
+    """Cambiar estado de una acción correctiva"""
+    accion = db.query(AccionCorrectiva).filter(AccionCorrectiva.id == accion_id).first()
+    if not accion:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Acción correctiva no encontrada"
+        )
+    
+    accion.estado = estado_update.estado
+    db.commit()
+    db.refresh(accion)
+    return accion
+
+
+@router.patch("/acciones-correctivas/{accion_id}/implementar", response_model=AccionCorrectivaResponse)
+def implementar_accion_correctiva(
+    accion_id: UUID,
+    implementacion: AccionCorrectivaImplementacion,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["noconformidades.gestion", "sistema.admin"]))
+):
+    """Implementar una acción correctiva"""
+    accion = db.query(AccionCorrectiva).filter(AccionCorrectiva.id == accion_id).first()
+    if not accion:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Acción correctiva no encontrada"
+        )
+    
+    from datetime import date
+    # Asignar quien implementó la acción
+    accion.implementado_por = current_user.id
+    
+    # Si no se proporciona fecha de implementación, usar la fecha actual
+    if implementacion.fechaImplementacion:
+        accion.fecha_implementacion = implementacion.fechaImplementacion
+    else:
+        accion.fecha_implementacion = date.today()
+    
+    # Actualizar otros campos si se proporcionan
+    if implementacion.observacion:
+        accion.observacion = implementacion.observacion
+    if implementacion.evidencias:
+        accion.evidencias = implementacion.evidencias
+    if implementacion.estado:
+        accion.estado = implementacion.estado
+    else:
+        accion.estado = "implementada"
+    
+    db.commit()
+    db.refresh(accion)
+    
+    # Cargar relaciones para la respuesta
+    accion = db.query(AccionCorrectiva).options(
+        joinedload(AccionCorrectiva.responsable),
+        joinedload(AccionCorrectiva.implementador),
+        joinedload(AccionCorrectiva.verificador),
+        joinedload(AccionCorrectiva.comentarios).joinedload(AccionCorrectivaComentario.usuario)
+    ).filter(AccionCorrectiva.id == accion_id).first()
+    
+    return accion
+
+
+@router.patch("/acciones-correctivas/{accion_id}/verificar", response_model=AccionCorrectivaResponse)
+def verificar_accion_correctiva(
+    accion_id: UUID,
+    verificacion: AccionCorrectivaVerificacion,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["noconformidades.cerrar", "sistema.admin"]))
+):
+    """Verificar una acción correctiva"""
+    # Verify permission "noconformidades.cerrar"
+    tiene_permiso = any(
+        rp.permiso.codigo == "noconformidades.cerrar" 
+        for ur in current_user.roles 
+        for rp in ur.rol.permisos
+        if rp.permiso
+    )
+    if not tiene_permiso:
+        raise HTTPException(status_code=403, detail="No tienes permiso para cerrar no conformidades")
+
+    service = CalidadService(db)
+    accion = service.cerrar_accion(
+        accion_id=accion_id,
+        verificacion_data=verificacion.model_dump(exclude_unset=True, by_alias=False),
+        usuario_id=current_user.id,
+    )
+
+    # Cargar relaciones para la respuesta (mismo contrato del endpoint)
+    accion = db.query(AccionCorrectiva).options(
+        joinedload(AccionCorrectiva.responsable),
+        joinedload(AccionCorrectiva.implementador),
+        joinedload(AccionCorrectiva.verificador),
+        joinedload(AccionCorrectiva.comentarios).joinedload(AccionCorrectivaComentario.usuario)
+    ).filter(AccionCorrectiva.id == accion_id).first()
+    
+    return accion
+
+
+from ..services.email import email_service
+
+@router.post("/acciones-correctivas/{accion_id}/comentarios", response_model=AccionCorrectivaComentarioResponse)
+async def crear_comentario_accion(
+    accion_id: UUID,
+    comentario: AccionCorrectivaComentarioCreate,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["noconformidades.gestion", "noconformidades.cerrar", "sistema.admin"]))
+):
+    """Agregar un comentario a una acción correctiva"""
+    # Verificar que la acción existe con sus responsables cargados
+    accion = db.query(AccionCorrectiva).options(
+        joinedload(AccionCorrectiva.responsable),
+        joinedload(AccionCorrectiva.implementador),
+        joinedload(AccionCorrectiva.verificador)
+    ).filter(AccionCorrectiva.id == accion_id).first()
+    
+    if not accion:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Acción correctiva no encontrada"
+        )
+    
+    nuevo_comentario = AccionCorrectivaComentario(
+        accion_correctiva_id=accion_id,
+        usuario_id=current_user.id,
+        comentario=comentario.comentario
+    )
+    
+    db.add(nuevo_comentario)
+    db.commit()
+    db.refresh(nuevo_comentario)
+    
+    # Notificar a los involucrados (background task idealmente, pero await aquí por simplicidad del stub)
+    involucrados = []
+    if accion.responsable: involucrados.append(accion.responsable)
+    if accion.implementador: involucrados.append(accion.implementador)
+    if accion.verificador: involucrados.append(accion.verificador)
+    
+    # Filtrar duplicados se hace en el servicio
+    await email_service.notificar_nuevo_comentario(accion, current_user, comentario.comentario, involucrados)
+
+    comentario_completo = db.query(AccionCorrectivaComentario).options(
+        joinedload(AccionCorrectivaComentario.usuario)
+    ).filter(AccionCorrectivaComentario.id == nuevo_comentario.id).first()
+    
+    return comentario_completo
+
+
+@router.patch("/acciones-correctivas/{accion_id}/estado", response_model=AccionCorrectivaResponse)
+def actualizar_estado_accion(
+    accion_id: UUID,
+    estado: str = Body(..., embed=True),
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["noconformidades.gestion", "noconformidades.cerrar", "sistema.admin"]))
+):
+    """Actualizar manualmente el estado de una acción correctiva (ej. cerrar)"""
+    # Verificar permisos (se podría refinar, por ahora cualquiera con acceso al modulo)
+    
+    accion = db.query(AccionCorrectiva).filter(AccionCorrectiva.id == accion_id).first()
+    if not accion:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Acción correctiva no encontrada"
+        )
+    
+    # Validar transiciones permitidas
+    if estado == "cerrada" and accion.estado != "verificada":
+         raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Solo se pueden cerrar acciones verificadas"
+        )
+        
+    accion.estado = estado
+    
+    db.commit()
+    db.refresh(accion)
+    
+    # Cargar relaciones
+    accion = db.query(AccionCorrectiva).options(
+        joinedload(AccionCorrectiva.responsable),
+        joinedload(AccionCorrectiva.implementador),
+        joinedload(AccionCorrectiva.verificador),
+        joinedload(AccionCorrectiva.comentarios).joinedload(AccionCorrectivaComentario.usuario)
+    ).filter(AccionCorrectiva.id == accion_id).first()
+
+    return accion
+
+
+# ================================
+# Endpoints de Objetivos de Calidad
+# ================================
+
+@router.get("/objetivos-calidad", response_model=List[ObjetivoCalidadResponse])
+def listar_objetivos_calidad(
+    skip: int = 0,
+    limit: int = 100,
+    area_id: UUID = None,
+    estado: str = None,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["calidad.ver", "sistema.admin"]))
+):
+    """Listar objetivos de calidad"""
+    query = db.query(ObjetivoCalidad).options(
+        joinedload(ObjetivoCalidad.area),
+        joinedload(ObjetivoCalidad.responsable)
+    )
+    
+    if area_id:
+        query = query.filter(ObjetivoCalidad.area_id == area_id)
+    if estado:
+        estados = [s.strip() for s in estado.split(",") if s.strip()]
+        if len(estados) > 1:
+            query = query.filter(ObjetivoCalidad.estado.in_(estados))
+        elif len(estados) == 1:
+            query = query.filter(ObjetivoCalidad.estado == estados[0])
+    
+    objetivos = query.offset(skip).limit(limit).all()
+    
+    # Auto-transición de estados según fechas
+    from datetime import datetime, timezone
+    ahora = datetime.now(timezone.utc)
+    cambios = False
+    for obj in objetivos:
+        # Planificado → En curso: si la fecha de inicio ya pasó
+        if obj.estado == 'planificado' and obj.fecha_inicio <= ahora:
+            obj.estado = 'en_curso'
+            cambios = True
+        # En curso → No cumplido: si la fecha fin ya pasó y progreso < 100
+        elif obj.estado == 'en_curso' and obj.fecha_fin <= ahora and (obj.progreso or 0) < 100:
+            obj.estado = 'no_cumplido'
+            cambios = True
+    
+    if cambios:
+        db.commit()
+    
+    return objetivos
+
+
+@router.post("/objetivos-calidad", response_model=ObjetivoCalidadResponse, status_code=status.HTTP_201_CREATED)
+def crear_objetivo_calidad(
+    objetivo: ObjetivoCalidadCreate, 
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["calidad.ver", "sistema.admin"]))
+):
+    """Crear un nuevo objetivo de calidad"""
+    if not objetivo.area_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="El área es obligatoria para el objetivo de calidad"
+        )
+
+    if not objetivo.responsable_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="El responsable es obligatorio para el objetivo de calidad"
+        )
+
+    area = db.query(Area).filter(Area.id == objetivo.area_id).first()
+    if not area:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="El área seleccionada no existe"
+        )
+
+    _obtener_usuario_activo(db, objetivo.responsable_id, "responsable")
+
+    objetivo_data = objetivo.model_dump()
+    objetivo_data["codigo"] = asignar_codigo(
+        db,
+        ObjetivoCalidad,
+        objetivo_data.get("codigo"),
+        prefijo_anual("OBJ"),
+    )
+
+    nuevo_objetivo = ObjetivoCalidad(**objetivo_data)
+    db.add(nuevo_objetivo)
+    db.commit()
+    nuevo_objetivo = db.query(ObjetivoCalidad).options(
+        joinedload(ObjetivoCalidad.area),
+        joinedload(ObjetivoCalidad.responsable)
+    ).filter(ObjetivoCalidad.id == nuevo_objetivo.id).first()
+    notificar_asignacion(
+        db,
+        usuario_id=nuevo_objetivo.responsable_id,
+        titulo="Objetivo de calidad asignado",
+        mensaje=f"Se te ha asignado el objetivo {nuevo_objetivo.codigo}",
+        referencia_tipo="objetivo",
+        referencia_id=nuevo_objetivo.id,
+        actor_id=current_user.id,
+    )
+    return nuevo_objetivo
+
+
+@router.get("/objetivos-calidad/{objetivo_id}", response_model=ObjetivoCalidadResponse)
+def obtener_objetivo_calidad(
+    objetivo_id: UUID, 
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["calidad.ver", "sistema.admin"]))
+):
+    """Obtener un objetivo de calidad por ID"""
+    objetivo = db.query(ObjetivoCalidad).options(
+        joinedload(ObjetivoCalidad.area),
+        joinedload(ObjetivoCalidad.responsable)
+    ).filter(ObjetivoCalidad.id == objetivo_id).first()
+    if not objetivo:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Objetivo de calidad no encontrado"
+        )
+    return objetivo
+
+
+@router.put("/objetivos-calidad/{objetivo_id}", response_model=ObjetivoCalidadResponse)
+def actualizar_objetivo_calidad(
+    objetivo_id: UUID,
+    objetivo_update: ObjetivoCalidadUpdate,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["calidad.ver", "sistema.admin"]))
+):
+    """Actualizar un objetivo de calidad"""
+    objetivo = db.query(ObjetivoCalidad).filter(ObjetivoCalidad.id == objetivo_id).first()
+    if not objetivo:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Objetivo de calidad no encontrado"
+        )
+
+    anterior_responsable = objetivo.responsable_id
+    update_data = objetivo_update.model_dump(exclude_unset=True)
+
+    fecha_inicio = update_data.get("fecha_inicio", objetivo.fecha_inicio)
+    fecha_fin = update_data.get("fecha_fin", objetivo.fecha_fin)
+    if fecha_fin <= fecha_inicio:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="La fecha de fin debe ser posterior a la fecha de inicio"
+        )
+
+    if "area_id" in update_data and update_data["area_id"]:
+        area = db.query(Area).filter(Area.id == update_data["area_id"]).first()
+        if not area:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="El área seleccionada no existe"
+            )
+
+    if "responsable_id" in update_data and update_data["responsable_id"]:
+        _obtener_usuario_activo(db, update_data["responsable_id"], "responsable")
+
+    if "codigo" in update_data and update_data["codigo"]:
+        codigo_normalizado = update_data["codigo"].strip().upper()
+        existe_codigo = db.query(ObjetivoCalidad).filter(
+            ObjetivoCalidad.codigo == codigo_normalizado,
+            ObjetivoCalidad.id != objetivo_id
+        ).first()
+        if existe_codigo:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="El código de objetivo ya existe"
+            )
+        update_data["codigo"] = codigo_normalizado
+
+    for field, value in update_data.items():
+        setattr(objetivo, field, value)
+    
+    db.commit()
+    objetivo = db.query(ObjetivoCalidad).options(
+        joinedload(ObjetivoCalidad.area),
+        joinedload(ObjetivoCalidad.responsable)
+    ).filter(ObjetivoCalidad.id == objetivo_id).first()
+    notificar_asignacion(
+        db,
+        usuario_id=objetivo.responsable_id,
+        titulo="Objetivo de calidad asignado",
+        mensaje=f"Se te ha asignado el objetivo {objetivo.codigo}",
+        referencia_tipo="objetivo",
+        referencia_id=objetivo.id,
+        actor_id=current_user.id,
+        anterior_usuario_id=anterior_responsable,
+    )
+    return objetivo
+
+
+@router.delete("/objetivos-calidad/{objetivo_id}", status_code=status.HTTP_204_NO_CONTENT)
+def eliminar_objetivo_calidad(
+    objetivo_id: UUID, 
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["calidad.ver", "sistema.admin"]))
+):
+    """Eliminar un objetivo de calidad"""
+    objetivo = db.query(ObjetivoCalidad).filter(ObjetivoCalidad.id == objetivo_id).first()
+    if not objetivo:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Objetivo de calidad no encontrado"
+        )
+
+    seguimientos_count = db.query(SeguimientoObjetivo).filter(
+        SeguimientoObjetivo.objetivo_calidad_id == objetivo_id
+    ).count()
+    if seguimientos_count > 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="No se puede eliminar el objetivo porque tiene seguimientos registrados"
+        )
+
+    if objetivo.estado in {"en_curso", "cumplido"}:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"No se puede eliminar un objetivo en estado '{objetivo.estado}'. Debe cancelarlo primero"
+        )
+
+    if objetivo.estado != "cancelado":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Solo se pueden eliminar objetivos en estado 'cancelado'"
+        )
+
+    db.delete(objetivo)
+    db.commit()
+    return None
+
+
+
+# ================================
+# Endpoints de Seguimiento Objetivos
+# ================================
+
+@router.get("/seguimientos-objetivo", response_model=List[SeguimientoObjetivoResponse])
+def listar_seguimientos_objetivo(
+    skip: int = 0,
+    limit: int = 100,
+    objetivo_id: UUID = None,
+    # TODO: filtrar por fecha?
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["calidad.ver", "sistema.admin"]))
+):
+    """Listar seguimientos de objetivos"""
+    query = db.query(SeguimientoObjetivo)
+    
+    if objetivo_id:
+        query = query.filter(SeguimientoObjetivo.objetivo_calidad_id == objetivo_id)
+    
+    # Ordenar por fecha descendente
+    query = query.order_by(SeguimientoObjetivo.fecha_seguimiento.desc())
+    
+    seguimientos = query.offset(skip).limit(limit).all()
+    return seguimientos
+
+
+@router.post("/seguimientos-objetivo", response_model=SeguimientoObjetivoResponse, status_code=status.HTTP_201_CREATED)
+def crear_seguimiento_objetivo(
+    seguimiento: SeguimientoObjetivoCreate, 
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["calidad.ver", "sistema.admin"]))
+):
+    """Crear un nuevo seguimiento de objetivo"""
+    # Verificar que el objetivo existe
+    objetivo = db.query(ObjetivoCalidad).filter(ObjetivoCalidad.id == seguimiento.objetivo_calidad_id).first()
+    if not objetivo:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Objetivo de calidad no encontrado"
+        )
+    
+    payload = seguimiento.model_dump()
+    if payload.get("responsable_id"):
+        _obtener_usuario_activo(db, payload["responsable_id"], "responsable")
+
+    nuevo_seguimiento = SeguimientoObjetivo(**payload)
+    db.add(nuevo_seguimiento)
+    
+    # Auto-actualizar progreso del objetivo si hay valor_meta y valor_actual
+    if seguimiento.valor_actual is not None and objetivo.valor_meta and objetivo.valor_meta > 0:
+        progreso = min((seguimiento.valor_actual / objetivo.valor_meta) * 100, 100)
+        objetivo.progreso = progreso
+        
+        # Auto-marcar como cumplido si progreso >= 100%
+        if progreso >= 100 and objetivo.estado not in ('cumplido', 'cancelado'):
+            objetivo.estado = 'cumplido'
+    
+    # Auto-transición: si está "planificado" y la fecha de inicio ya pasó, cambiar a "en_curso"
+    from datetime import datetime, timezone
+    ahora = datetime.now(timezone.utc)
+    if objetivo.estado == 'planificado' and objetivo.fecha_inicio <= ahora:
+        objetivo.estado = 'en_curso'
+    
+    db.commit()
+    db.refresh(nuevo_seguimiento)
+    notificar_asignacion(
+        db,
+        usuario_id=nuevo_seguimiento.responsable_id,
+        titulo="Seguimiento de objetivo asignado",
+        mensaje="Se te ha asignado un seguimiento de objetivo de calidad",
+        referencia_tipo="objetivo",
+        referencia_id=nuevo_seguimiento.objetivo_calidad_id,
+        actor_id=current_user.id,
+    )
+    return nuevo_seguimiento
+
+
+@router.put("/seguimientos-objetivo/{seguimiento_id}", response_model=SeguimientoObjetivoResponse)
+def actualizar_seguimiento_objetivo(
+    seguimiento_id: UUID,
+    seguimiento_update: SeguimientoObjetivoUpdate,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["calidad.ver", "sistema.admin"]))
+):
+    """Actualizar un seguimiento de objetivo"""
+    seguimiento = db.query(SeguimientoObjetivo).filter(SeguimientoObjetivo.id == seguimiento_id).first()
+    if not seguimiento:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Seguimiento no encontrado"
+        )
+
+    anterior_responsable = seguimiento.responsable_id
+    update_data = seguimiento_update.model_dump(exclude_unset=True)
+    if "responsable_id" in update_data and update_data["responsable_id"]:
+        _obtener_usuario_activo(db, update_data["responsable_id"], "responsable")
+
+    for field, value in update_data.items():
+        setattr(seguimiento, field, value)
+    
+    db.commit()
+    db.refresh(seguimiento)
+    notificar_asignacion(
+        db,
+        usuario_id=seguimiento.responsable_id,
+        titulo="Seguimiento de objetivo asignado",
+        mensaje="Se te ha asignado un seguimiento de objetivo de calidad",
+        referencia_tipo="objetivo",
+        referencia_id=seguimiento.objetivo_calidad_id,
+        actor_id=current_user.id,
+        anterior_usuario_id=anterior_responsable,
+    )
+    return seguimiento
+
+
+@router.delete("/seguimientos-objetivo/{seguimiento_id}", status_code=status.HTTP_204_NO_CONTENT)
+def eliminar_seguimiento_objetivo(
+    seguimiento_id: UUID, 
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(require_any_permission(["calidad.ver", "sistema.admin"]))
+):
+    """Eliminar un seguimiento de objetivo"""
+    seguimiento = db.query(SeguimientoObjetivo).filter(SeguimientoObjetivo.id == seguimiento_id).first()
+    if not seguimiento:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Seguimiento no encontrado"
+        )
+    
+    db.delete(seguimiento)
+    db.commit()
+    return None
